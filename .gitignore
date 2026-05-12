@@ -1,0 +1,9 @@
+/docs/
+/lib/
+/bin/
+/.shards/
+*.dwarf
+.DS_Store
+
+# Gitignored — workspace path-deps overlay for local development.
+shard.override.yml
