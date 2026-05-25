@@ -112,6 +112,58 @@ describe MartenSignedId do
       end
     end
 
+    it "raises InsecureSecretError when caller-supplied key: is empty" do
+      # MSR-N1: the length check must apply to any non-nil key:, not
+      # just the default Marten.settings.secret_key path. An empty
+      # string would otherwise silently produce a forgeable token.
+      expect_raises(MartenSignedId::InsecureSecretError, /Caller-supplied key.*at least 32 bytes/) do
+        MartenSignedId.sign(42, purpose: "transfer", key: "")
+      end
+    end
+
+    it "raises InsecureSecretError when caller-supplied key: is shorter than the minimum" do
+      expect_raises(MartenSignedId::InsecureSecretError, /Caller-supplied key.*at least 32 bytes/) do
+        MartenSignedId.sign(42, purpose: "transfer", key: "short")
+      end
+    end
+
+    it "accepts a caller-supplied key: at exactly SECRET_KEY_MIN_BYTES" do
+      key = "x" * 32
+      token = MartenSignedId.sign(42, purpose: "transfer", key: key)
+      MartenSignedId.verify(token, purpose: "transfer", key: key).should eq("42")
+    end
+
+    it "raises InsecureSecretError when verifying with a caller-supplied short key:" do
+      # Symmetric to sign — verify must reject short caller keys too,
+      # otherwise the check could be skipped at the read-side.
+      expect_raises(MartenSignedId::InsecureSecretError, /Caller-supplied key.*at least 32 bytes/) do
+        MartenSignedId.verify("doesn't-matter", purpose: "transfer", key: "")
+      end
+    end
+
+    it "InsecureSecretError is catchable via the umbrella MartenSignedId::Error" do
+      # MSR-N2: rescue MartenSignedId::Error should catch both
+      # verification-failure and misconfiguration exceptions.
+      original = Marten.settings.secret_key
+      begin
+        Marten.settings.secret_key = "tiny"
+        expect_raises(MartenSignedId::Error) do
+          MartenSignedId.sign(42, purpose: "transfer")
+        end
+      ensure
+        Marten.settings.secret_key = original
+      end
+    end
+
+    it "InvalidSignedIdError is catchable via the umbrella MartenSignedId::Error" do
+      # MSR-N2: reparenting must not break the existing
+      # InvalidSignedIdError hierarchy. find_signed! still raises
+      # InvalidSignedIdError on a bad token, and Error now catches it.
+      expect_raises(MartenSignedId::Error) do
+        Widget.find_signed!("garbage", purpose: "test")
+      end
+    end
+
     it "rejects a token whose embedded payload version is unknown" do
       # L4: forge a token via the lower-level Signer with a future
       # version marker. We expect verify to ignore it rather than
@@ -206,6 +258,12 @@ describe MartenSignedId do
 
       shared_token = widget.signed_id(purpose: "transfer")
       Widget.find_signed(shared_token, purpose: "transfer").should eq(widget)
+      # MSR-N3: pin the documented "load-bearing warning" — the same
+      # token genuinely redeems against a different model when both
+      # have a row with the matching PK and the purpose collides. If
+      # this assertion ever flips to be_nil, a model-scoping change
+      # has crept in and the README docs above need updating.
+      Gizmo.find_signed(shared_token, purpose: "transfer").should_not be_nil
       # Cross-redemption works on a generic purpose — the warning in the
       # README is load-bearing. Use a namespaced purpose to prevent it:
       ns_token = widget.signed_id(purpose: "widget:transfer")

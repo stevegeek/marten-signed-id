@@ -56,17 +56,17 @@ User.find_signed!(token, purpose: "transfer")  # => User (raises on miss)
 ## Errors
 
 ```
-MartenSignedId::InvalidSignedIdError              # base — signature/expiry/purpose miss
-├── MartenSignedId::ExpiredSignedIdError          # reserved (see below)
-├── MartenSignedId::TamperedSignedIdError         # reserved (see below)
-└── MartenSignedId::SignedRecordNotFoundError     # verify ok, row gone or pk un-castable
-
-MartenSignedId::InsecureSecretError               # signing key too short / missing
+MartenSignedId::Error                                # umbrella — rescue this to catch everything
+├── MartenSignedId::InvalidSignedIdError             # base — signature/expiry/purpose miss
+│   ├── MartenSignedId::ExpiredSignedIdError         # reserved (see below)
+│   ├── MartenSignedId::TamperedSignedIdError        # reserved (see below)
+│   └── MartenSignedId::SignedRecordNotFoundError    # verify ok, row gone or pk un-castable
+└── MartenSignedId::InsecureSecretError              # signing key too short / missing
 ```
 
 `ExpiredSignedIdError` and `TamperedSignedIdError` are defined for forward compatibility but not raised today: `Marten::Core::Signer#unsign` collapses both into a single `nil` return, so this shard cannot distinguish them without bypassing the signer. They will be wired up if/when the underlying signer surfaces the difference. Until then, catch `InvalidSignedIdError` for both.
 
-`MartenSignedId::InsecureSecretError` is raised on the first `sign`/`verify` call if `Marten.settings.secret_key` is shorter than 32 bytes. Misconfiguration fails loudly rather than silently producing forgeable tokens.
+`MartenSignedId::InsecureSecretError` is raised on the first `sign`/`verify` call if the effective signing key is shorter than 32 bytes. This applies to both the default `Marten.settings.secret_key` and any caller-supplied `key:` argument — passing `key: ""` or `key: "short"` does not bypass the check. Misconfiguration fails loudly rather than silently producing forgeable tokens.
 
 ## Purpose scoping
 

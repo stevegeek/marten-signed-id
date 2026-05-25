@@ -36,11 +36,25 @@ module MartenSignedId
   # Current on-the-wire payload version. `verify` rejects unknown
   # versions so future format changes can be introduced without breaking
   # in-flight tokens.
+  #
+  # Bumping this constant rejects in-flight v=1 tokens — fine for a
+  # single-process restart, a footgun for rolling deploys where old and
+  # new app versions run concurrently. For a zero-downtime version
+  # change, first replace this with a `SUPPORTED_VERSIONS = Set{1, 2}`
+  # and have `verify` accept any member, deploy the dual-accepting
+  # build across all nodes, then drop v=1 from the set after the
+  # longest outstanding token TTL has elapsed.
   PAYLOAD_VERSION = 1
+
+  # Umbrella base class — every exception this shard raises descends
+  # from `Error`. Callers can `rescue MartenSignedId::Error` to catch
+  # both verification failures (`InvalidSignedIdError` family) and
+  # misconfiguration (`InsecureSecretError`) in one clause.
+  class Error < ::Exception; end
 
   # Base class for sign/verify failures (bad signature, expiry, purpose
   # mismatch, record gone).
-  class InvalidSignedIdError < ::Exception; end
+  class InvalidSignedIdError < Error; end
 
   # Raised when `expires_in` has elapsed.
   #
@@ -59,19 +73,20 @@ module MartenSignedId
   # passed but the referenced row no longer exists in the database.
   class SignedRecordNotFoundError < InvalidSignedIdError; end
 
-  # Raised when the signing key (`Marten.settings.secret_key`) is
-  # shorter than `SECRET_KEY_MIN_BYTES`. Surfaced on the first
-  # `sign` / `verify` call so misconfiguration fails loudly rather
-  # than silently producing forgeable tokens.
-  class InsecureSecretError < ::Exception; end
+  # Raised when the signing key (either `Marten.settings.secret_key` or
+  # a caller-supplied `key:`) is shorter than `SECRET_KEY_MIN_BYTES`.
+  # Surfaced on the first `sign` / `verify` call so misconfiguration
+  # fails loudly rather than silently producing forgeable tokens.
+  class InsecureSecretError < Error; end
 
   # Sign the given id with a purpose + optional expiry. `id` is
   # stringified so any pk type round-trips through the token.
   #
   # Pass `key:` to override the signing key for this call (used to
   # implement per-purpose key derivation — see the README). The default
-  # is `Marten.settings.secret_key`, which must be at least
-  # `SECRET_KEY_MIN_BYTES`; shorter keys raise `InsecureSecretError`.
+  # is `Marten.settings.secret_key`. Either way the key must be at
+  # least `SECRET_KEY_MIN_BYTES`; shorter keys raise
+  # `InsecureSecretError`.
   def self.sign(
     id,
     purpose : String,
@@ -82,9 +97,6 @@ module MartenSignedId
     raise ArgumentError.new("expires_in must be positive") if expires_in && !expires_in.positive?
     validate_secret_key!(key)
 
-    # L1: a per-call `Marten::Core::Signer.new` is cheap (no per-instance
-    # state worth caching), but if profiling ever shows the allocation
-    # hot, a module-level memoised signer per key would be safe.
     payload = {"v" => PAYLOAD_VERSION, "i" => id.to_s, "p" => purpose}.to_json
     expires = expires_in.try { |span| Time.utc + span }
     Marten::Core::Signer.new(key: key).sign(payload, expires: expires)
@@ -95,7 +107,8 @@ module MartenSignedId
   # `nil` otherwise.
   #
   # Pass `key:` to verify against a non-default key (paired with the
-  # same option on `sign`).
+  # same option on `sign`). The same minimum-length check applies as
+  # on `sign`.
   def self.verify(token : String, purpose : String, key : String? = nil) : String?
     raise ArgumentError.new("purpose must be non-blank") if purpose.blank?
     validate_secret_key!(key)
@@ -114,19 +127,29 @@ module MartenSignedId
     parsed["i"]?.try(&.as_s?)
   end
 
-  # Asserts that the default `Marten.settings.secret_key` is at least
-  # `SECRET_KEY_MIN_BYTES`. Called from `sign` / `verify` before any
-  # cryptographic work so misconfiguration fails loudly. Caller-
-  # supplied `key:` is the caller's responsibility today.
+  # Asserts that the effective signing key is at least
+  # `SECRET_KEY_MIN_BYTES`. When `caller_key` is `nil`, the default
+  # `Marten.settings.secret_key` is checked; when non-nil, the
+  # caller-supplied key is checked. Both paths share the same length
+  # bar so callers can't bypass the minimum by passing `key: ""`.
+  # Called from `sign` / `verify` before any cryptographic work.
   protected def self.validate_secret_key!(caller_key : String? = nil) : Nil
-    return unless caller_key.nil?
-
-    key = Marten.settings.secret_key
-    if key.bytesize < SECRET_KEY_MIN_BYTES
-      raise InsecureSecretError.new(
-        "Marten.settings.secret_key must be at least #{SECRET_KEY_MIN_BYTES} bytes " \
-        "(was #{key.bytesize}). Configure a longer secret before issuing signed IDs.",
-      )
+    if caller_key.nil?
+      key = Marten.settings.secret_key
+      if key.bytesize < SECRET_KEY_MIN_BYTES
+        raise InsecureSecretError.new(
+          "Marten.settings.secret_key must be at least #{SECRET_KEY_MIN_BYTES} bytes " \
+          "(was #{key.bytesize}). Configure a longer secret before issuing signed IDs.",
+        )
+      end
+    else
+      if caller_key.bytesize < SECRET_KEY_MIN_BYTES
+        raise InsecureSecretError.new(
+          "Caller-supplied key: must be at least #{SECRET_KEY_MIN_BYTES} bytes " \
+          "(was #{caller_key.bytesize}). Derive a longer key (e.g. HMAC-SHA256 hex digest) " \
+          "before issuing signed IDs.",
+        )
+      end
     end
   end
 
