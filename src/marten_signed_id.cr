@@ -33,7 +33,27 @@ module MartenSignedId
   # the threshold Rails enforces on its `MessageVerifier` key.
   SECRET_KEY_MIN_BYTES = 32
 
+  # Current on-the-wire payload version. `verify` rejects unknown
+  # versions so future format changes can be introduced without breaking
+  # in-flight tokens.
+  PAYLOAD_VERSION = 1
+
+  # Base class for sign/verify failures (bad signature, expiry, purpose
+  # mismatch, record gone).
   class InvalidSignedIdError < ::Exception; end
+
+  # Raised when `expires_in` has elapsed.
+  #
+  # Note: the underlying `Marten::Core::Signer#unsign` currently
+  # collapses tamper and expiry into a single `nil` return, so this
+  # class is reserved for callers that introduce richer signer
+  # plumbing. Today, both surface as `InvalidSignedIdError` from
+  # `find_signed!`.
+  class ExpiredSignedIdError < InvalidSignedIdError; end
+
+  # Raised when the digest doesn't match — signature was forged or
+  # corrupted. See note on `ExpiredSignedIdError`.
+  class TamperedSignedIdError < InvalidSignedIdError; end
 
   # Raised by `find_signed!` when the signature/expiry/purpose check
   # passed but the referenced row no longer exists in the database.
@@ -58,9 +78,14 @@ module MartenSignedId
     expires_in : Time::Span? = nil,
     key : String? = nil,
   ) : String
+    raise ArgumentError.new("purpose must be non-blank") if purpose.blank?
+    raise ArgumentError.new("expires_in must be positive") if expires_in && !expires_in.positive?
     validate_secret_key!(key)
 
-    payload = {"i" => id.to_s, "p" => purpose}.to_json
+    # L1: a per-call `Marten::Core::Signer.new` is cheap (no per-instance
+    # state worth caching), but if profiling ever shows the allocation
+    # hot, a module-level memoised signer per key would be safe.
+    payload = {"v" => PAYLOAD_VERSION, "i" => id.to_s, "p" => purpose}.to_json
     expires = expires_in.try { |span| Time.utc + span }
     Marten::Core::Signer.new(key: key).sign(payload, expires: expires)
   end
@@ -72,20 +97,21 @@ module MartenSignedId
   # Pass `key:` to verify against a non-default key (paired with the
   # same option on `sign`).
   def self.verify(token : String, purpose : String, key : String? = nil) : String?
+    raise ArgumentError.new("purpose must be non-blank") if purpose.blank?
     validate_secret_key!(key)
 
     data = Marten::Core::Signer.new(key: key).unsign(token)
     return nil if data.nil?
 
-    parsed = begin
-      JSON.parse(data).as_h?
-    rescue JSON::ParseException
-      nil
-    end
+    # JSON parsing intentionally not rescued: at this point the
+    # signature has already been verified, so a parse failure indicates
+    # a bug on the signer side rather than an attack — let it surface.
+    parsed = JSON.parse(data).as_h?
     return nil if parsed.nil?
 
-    return nil unless parsed["p"]?.try(&.as_s) == purpose
-    parsed["i"]?.try(&.as_s)
+    return nil unless parsed["v"]?.try(&.as_i?) == PAYLOAD_VERSION
+    return nil unless parsed["p"]?.try(&.as_s?) == purpose
+    parsed["i"]?.try(&.as_s?)
   end
 
   # Asserts that the default `Marten.settings.secret_key` is at least
