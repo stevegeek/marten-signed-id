@@ -19,8 +19,8 @@ require "json"
 #
 # token = user.signed_id(purpose: "transfer", expires_in: 4.hours)
 #
-# User.find_signed(token, purpose: "transfer")   # => User? (nil if expired/invalid/mismatched purpose)
-# User.find_signed!(token, purpose: "transfer")  # => User (raises InvalidSignedIdError)
+# User.find_signed(token, purpose: "transfer")  # => User? (nil if expired/invalid/mismatched purpose)
+# User.find_signed!(token, purpose: "transfer") # => User (raises InvalidSignedIdError)
 # ```
 #
 # Purpose mismatch (a token issued for `"transfer"` used with
@@ -28,21 +28,53 @@ require "json"
 module MartenSignedId
   VERSION = "0.1.0"
 
-  class InvalidSignedIdError < Exception; end
+  # Minimum acceptable length, in bytes, of `Marten.settings.secret_key`.
+  # 32 bytes (256 bits) matches the HMAC-SHA256 block-size guidance and
+  # the threshold Rails enforces on its `MessageVerifier` key.
+  SECRET_KEY_MIN_BYTES = 32
+
+  class InvalidSignedIdError < ::Exception; end
+
+  # Raised by `find_signed!` when the signature/expiry/purpose check
+  # passed but the referenced row no longer exists in the database.
+  class SignedRecordNotFoundError < InvalidSignedIdError; end
+
+  # Raised when the signing key (`Marten.settings.secret_key`) is
+  # shorter than `SECRET_KEY_MIN_BYTES`. Surfaced on the first
+  # `sign` / `verify` call so misconfiguration fails loudly rather
+  # than silently producing forgeable tokens.
+  class InsecureSecretError < ::Exception; end
 
   # Sign the given id with a purpose + optional expiry. `id` is
   # stringified so any pk type round-trips through the token.
-  def self.sign(id, purpose : String, expires_in : Time::Span? = nil) : String
+  #
+  # Pass `key:` to override the signing key for this call (used to
+  # implement per-purpose key derivation — see the README). The default
+  # is `Marten.settings.secret_key`, which must be at least
+  # `SECRET_KEY_MIN_BYTES`; shorter keys raise `InsecureSecretError`.
+  def self.sign(
+    id,
+    purpose : String,
+    expires_in : Time::Span? = nil,
+    key : String? = nil,
+  ) : String
+    validate_secret_key!(key)
+
     payload = {"i" => id.to_s, "p" => purpose}.to_json
     expires = expires_in.try { |span| Time.utc + span }
-    Marten::Core::Signer.new.sign(payload, expires: expires)
+    Marten::Core::Signer.new(key: key).sign(payload, expires: expires)
   end
 
   # Verify the token + purpose. Returns the original id string if the
   # token is valid (signature OK, not expired, purpose matches), or
   # `nil` otherwise.
-  def self.verify(token : String, purpose : String) : String?
-    data = Marten::Core::Signer.new.unsign(token)
+  #
+  # Pass `key:` to verify against a non-default key (paired with the
+  # same option on `sign`).
+  def self.verify(token : String, purpose : String, key : String? = nil) : String?
+    validate_secret_key!(key)
+
+    data = Marten::Core::Signer.new(key: key).unsign(token)
     return nil if data.nil?
 
     parsed = begin
@@ -56,29 +88,75 @@ module MartenSignedId
     parsed["i"]?.try(&.as_s)
   end
 
+  # Asserts that the default `Marten.settings.secret_key` is at least
+  # `SECRET_KEY_MIN_BYTES`. Called from `sign` / `verify` before any
+  # cryptographic work so misconfiguration fails loudly. Caller-
+  # supplied `key:` is the caller's responsibility today.
+  protected def self.validate_secret_key!(caller_key : String? = nil) : Nil
+    return unless caller_key.nil?
+
+    key = Marten.settings.secret_key
+    if key.bytesize < SECRET_KEY_MIN_BYTES
+      raise InsecureSecretError.new(
+        "Marten.settings.secret_key must be at least #{SECRET_KEY_MIN_BYTES} bytes " \
+        "(was #{key.bytesize}). Configure a longer secret before issuing signed IDs.",
+      )
+    end
+  end
+
   # Mixin for Marten models. Adds:
   #
   # - `record.signed_id(purpose:, expires_in:)` — instance method
   # - `Model.find_signed(token, purpose:)` — class method, returns the
-  #    record or `nil` (invalid signature, expired, purpose mismatch, or
-  #    record no longer exists)
+  #   record or `nil` (invalid signature, expired, purpose mismatch, or
+  #   record no longer exists)
   # - `Model.find_signed!(token, purpose:)` — class method, raises
-  #    `MartenSignedId::InvalidSignedIdError` on miss
+  #   `MartenSignedId::SignedRecordNotFoundError` if the row is gone
+  #   and `MartenSignedId::InvalidSignedIdError` for any other miss
   module ModelMixin
     macro included
       def self.find_signed(token : ::String, purpose : ::String) : self?
         id = ::MartenSignedId.verify(token, purpose)
         return nil if id.nil?
-        get(pk: id)
+
+        begin
+          get(pk: id)
+        rescue ::Marten::DB::Errors::UnexpectedFieldValue
+          # PK shape changed (e.g. schema rotation) — token's embedded id
+          # can no longer be cast to the current PK column type.
+          nil
+        rescue ::Marten::DB::Errors::RecordNotFound
+          # Defensive: `get` is documented to return nil rather than
+          # raise this, but keep the guard so a backend change can't
+          # turn a documented `nil` contract into a 500.
+          nil
+        end
       end
 
       def self.find_signed!(token : ::String, purpose : ::String) : self
-        find_signed(token, purpose) ||
+        id = ::MartenSignedId.verify(token, purpose)
+        if id.nil?
           raise ::MartenSignedId::InvalidSignedIdError.new("Invalid or expired signed id")
+        end
+
+        record = begin
+          get(pk: id)
+        rescue ::Marten::DB::Errors::UnexpectedFieldValue
+          nil
+        rescue ::Marten::DB::Errors::RecordNotFound
+          nil
+        end
+
+        record || raise ::MartenSignedId::SignedRecordNotFoundError.new(
+          "No #{self.name} matching the signed id"
+        )
       end
     end
 
     def signed_id(purpose : ::String, expires_in : ::Time::Span? = nil) : ::String
+      if pk.nil?
+        raise ::MartenSignedId::InvalidSignedIdError.new("Cannot sign an unpersisted record")
+      end
       ::MartenSignedId.sign(pk, purpose, expires_in)
     end
   end
